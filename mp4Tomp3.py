@@ -1,4 +1,3 @@
-import json
 import os
 import platform
 import subprocess
@@ -7,144 +6,115 @@ import threading
 import time
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import lru_cache
 from tkinter import filedialog, messagebox, ttk
-
 import psutil
 
+# 支持的视频文件扩展名
+VIDEO_EXTENSIONS = ['.mp4', '.mkv', '.flv', '.avi', '.mov', '.wmv', '.m4s']
 
-def find_entry_json_files(root_dir):
-    """递归查找所有entry.json文件（优化版）"""
-    json_files = []
+
+def find_video_files(root_dir):
+    """递归查找所有视频文件"""
+    video_files = []
     for root, dirs, files in os.walk(root_dir):
-        if 'entry.json' in files:
-            json_files.append(os.path.join(root, 'entry.json'))
+        for file in files:
+            ext = os.path.splitext(file)[1].lower()
+            if ext in VIDEO_EXTENSIONS:
+                video_files.append(os.path.join(root, file))
         # 限制目录深度，避免搜索过深
         dirs[:] = [d for d in dirs if not d.startswith('.')]  # 跳过隐藏目录
-    return json_files
+    return video_files
 
 
-@lru_cache(maxsize=None)
-def find_audio_file_cached(json_dir):
-    """缓存音频文件查找结果"""
-    return find_audio_file(json_dir)
+def get_video_name(video_path):
+    """从视频文件路径中提取文件名（不含扩展名）"""
+    filename = os.path.basename(video_path)
+    name, _ = os.path.splitext(filename)
+
+    # 清理文件名中的非法字符
+    invalid_chars = {'\\', '/', ':', '*', '?', '"', '<', '>', '|'}
+    clean_name = ''.join(c for c in name if c not in invalid_chars)
+
+    # 限制文件名长度
+    if len(clean_name) > 150:
+        clean_name = clean_name[:150]
+
+    return clean_name
 
 
-def find_audio_file(json_dir):
-    """在entry.json所在目录及其子目录中查找音频文件（优化版）"""
-    # 支持的音频文件扩展名（按优先级排序）
-    audio_extensions = ['.m4a', '.mp4', '.aac', '.flv', '.m4s']  # 更常见的音频格式优先
-
-    # 先在entry.json同目录查找
-    for ext in audio_extensions:
-        audio_path = os.path.join(json_dir, f'audio{ext}')
-        if os.path.exists(audio_path):
-            return audio_path
-
-    # 优化子目录搜索 - 只搜索常见音频目录
-    common_audio_dirs = {'audio', 'sound', 'voice', 'music'}
-    for root, dirs, files in os.walk(json_dir):
-        # 限制搜索深度
-        if root.count(os.sep) - json_dir.count(os.sep) > 2:
-            del dirs[:]
-            continue
-
-        # 优先搜索常见音频目录
-        dirs[:] = [d for d in dirs if d.lower() in common_audio_dirs or not d.startswith('.')]
-
-        for file in files:
-            file_lower = file.lower()
-            if any(file_lower.endswith(ext) for ext in audio_extensions):
-                # 优先匹配以"audio"开头的文件
-                if file_lower.startswith('audio'):
-                    return os.path.join(root, file)
-                # 返回第一个找到的音频文件（如果不需要严格匹配audio开头）
-                return os.path.join(root, file)
-
-    return None
-
-
-@lru_cache(maxsize=None)
-def extract_title_name_cached(json_path):
-    """缓存提取的title名称"""
-    return extract_title_name(json_path)
-
-
-def extract_title_name(json_path):
-    """从entry.json中提取part字段（优化版）"""
+def process_single_file(video_path, output_dir, progress_callback=None):
+    """处理单个视频文件（带进度回调）"""
     try:
-        with open(json_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            part_name = data.get('title', 'untitled')
-            # 清理文件名中的非法字符（优化清理逻辑）
-            invalid_chars = {'\\', '/', ':', '*', '?', '"', '<', '>', '|'}
-            part_name = ''.join(c for c in part_name if c not in invalid_chars)
-            # 限制文件名长度
-            if len(part_name) > 150:
-                part_name = part_name[:150]
-            return part_name
-    except Exception as e:
-        print(f"Error reading {json_path}: {e}")
-        return None
-
-
-def process_single_file(json_path, output_dir, progress_callback=None):
-    """处理单个entry.json对应的音频文件（带进度回调）"""
-    try:
-        # 使用缓存方法
-        part_name = extract_title_name_cached(json_path)
-        if not part_name:
+        print(f"Processing: {video_path}")
+        video_name = get_video_name(video_path)
+        if not video_name:
+            print(f"Invalid video name for: {video_path}")
             if progress_callback:
                 progress_callback(False)
             return False
 
-        # 使用缓存方法查找音频文件
-        json_dir = os.path.dirname(json_path)
-        audio_path = find_audio_file_cached(json_dir)
-        if not audio_path:
-            print(f"Audio file not found in {json_dir} or its subdirectories")
-            if progress_callback:
-                progress_callback(False)
-            return False
-
-        # 创建输出目录
         os.makedirs(output_dir, exist_ok=True)
+        final_mp3 = os.path.join(output_dir, f'{video_name}.mp3')
 
-        # 最终MP3文件路径
-        final_mp3 = os.path.join(output_dir, f'{part_name}.mp3')
-
-        # 检查文件是否已存在且不需要重新转换
         if os.path.exists(final_mp3) and os.path.getsize(final_mp3) > 0:
             print(f"Skipping existing file: {final_mp3}")
             if progress_callback:
                 progress_callback(True)
             return True
 
-        # 直接从音频文件转换为MP3（优化FFmpeg参数）
-        result = subprocess.run([
-            'ffmpeg',
-            '-hide_banner',  # 隐藏不必要的输出
-            '-loglevel', 'error',  # 只显示错误信息
-            '-i', audio_path,
-            '-c:a', 'libmp3lame',
-            '-q:a', '0',
-            '-y',
-            final_mp3
-        ], capture_output=True, text=True)
+        temp_aac = os.path.splitext(final_mp3)[0] + "_temp.aac"
 
-        if result.returncode == 0:
-            print(f"Successfully converted: {audio_path} -> {final_mp3}")
+        try:
+            print(f"Extracting audio for: {video_path}")
+            extract_result = subprocess.run([
+                'ffmpeg',
+                '-hide_banner',
+                '-loglevel', 'error',
+                '-i', video_path,
+                '-c:a', 'copy',
+                '-vn',
+                '-y',
+                temp_aac
+            ], capture_output=True, text=True)
+
+            if extract_result.returncode != 0:
+                raise RuntimeError(f"AAC extraction failed: {extract_result.stderr}")
+
+            print(f"Converting to MP3: {video_path}")
+            convert_result = subprocess.run([
+                'ffmpeg',
+                '-hide_banner',
+                '-loglevel', 'error',
+                '-i', temp_aac,
+                '-c:a', 'libmp3lame',
+                '-q:a', '0',
+                '-y',
+                final_mp3
+            ], capture_output=True, text=True)
+
+            if convert_result.returncode != 0:
+                raise RuntimeError(f"MP3 conversion failed: {convert_result.stderr}")
+
+            print(f"Successfully converted: {video_path} -> {final_mp3}")
             if progress_callback:
                 progress_callback(True)
             return True
-        else:
-            print(f"FFmpeg error processing {json_path}:\n{result.stderr}")
+
+        except Exception as e:
+            print(f"Error processing {video_path}: {str(e)}")
             if progress_callback:
                 progress_callback(False)
             return False
 
+        finally:
+            if os.path.exists(temp_aac):
+                try:
+                    os.remove(temp_aac)
+                except Exception as e:
+                    print(f"Failed to remove temp file {temp_aac}: {str(e)}")
+
     except Exception as e:
-        print(f"Error processing {json_path}: {str(e)}")
+        print(f"Unexpected error processing {video_path}: {str(e)}")
         if progress_callback:
             progress_callback(False)
         return False
@@ -155,41 +125,48 @@ def process_folders_parallel(input_dirs, output_dir, progress_callback=None, max
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    # 收集所有JSON文件
-    all_json_files = []
+    # 收集所有视频文件
+    all_video_files = []
     for input_dir in input_dirs:
-        all_json_files.extend(find_entry_json_files(input_dir))
+        all_video_files.extend(find_video_files(input_dir))
 
-    total = len(all_json_files)
+    total = len(all_video_files)
     if total == 0:
-        print("没有找到任何entry.json文件")
+        print("没有找到任何视频文件")
         return 0, 0
 
     # 如果没有指定最大工作线程数，则自动设置
     if max_workers is None:
         logical_cores = psutil.cpu_count(logical=True)
-        max_workers = logical_cores - 1
+        max_workers = max(1, logical_cores - 1)  # 确保至少1个线程
 
     # 使用线程池并行处理
     success = 0
     processed = 0
     lock = threading.Lock()  # 用于线程安全的计数
 
-    def task_wrapper(json_path):
+    def task_wrapper(video_path):
         nonlocal success, processed
-        result = process_single_file(json_path, output_dir, progress_callback)
+        result = process_single_file(video_path, output_dir,
+                                    lambda success_flag: progress_callback(success_flag) if progress_callback else None)
         with lock:
             processed += 1
             if result:
                 success += 1
+            # 更新进度
+            if progress_callback:
+                progress_callback(None)  # 触发进度更新
         return result
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(task_wrapper, json_path) for json_path in all_json_files]
+        futures = [executor.submit(task_wrapper, video_path) for video_path in all_video_files]
 
         # 等待所有任务完成
         for future in as_completed(futures):
-            future.result()  # 捕获任何异常
+            try:
+                future.result()  # 捕获任何异常
+            except Exception as e:
+                print(f"处理过程中发生异常: {str(e)}")
 
     return total, success
 
@@ -204,11 +181,10 @@ class ProgressWindow:
         self.root.resizable(False, False)
 
         # 防止重复创建Tk实例
-        if not hasattr(ProgressWindow, 'instance_created'):
-            ProgressWindow.instance_created = True
-        else:
+        if hasattr(ProgressWindow, 'instance_created'):
             self.root.destroy()
             return
+        ProgressWindow.instance_created = True
 
         self.total = total_tasks
         self.completed = 0
@@ -263,13 +239,14 @@ class ProgressWindow:
         self.root.protocol("WM_DELETE_WINDOW", self.cancel)
         self.root.after(100, self.update_time)
 
-    def update(self, success_flag):
+    def update(self, success_flag=None):
         if not self.running:
             return
 
-        self.completed += 1
-        if success_flag:
-            self.success += 1
+        if success_flag is not None:
+            if success_flag:
+                self.success += 1
+            self.completed += 1
 
         progress_value = min(100, int((self.completed / self.total) * 100))
         self.progress["value"] = progress_value
@@ -339,7 +316,7 @@ def select_output_dir():
 
 
 def main():
-    print("=== 音频提取转换工具 ===")
+    print("=== 一键.mp4To.mp3脚本 ===")
 
     # 检查ffmpeg是否可用
     try:
@@ -362,9 +339,9 @@ def main():
         return
 
     # 显示进度窗口
-    total_files = sum(len(find_entry_json_files(d)) for d in input_dirs)
+    total_files = sum(len(find_video_files(d)) for d in input_dirs)
     if total_files == 0:
-        messagebox.showinfo("提示", "没有找到任何entry.json文件")
+        messagebox.showinfo("提示", "没有找到任何视频文件")
         return
 
     progress_window = ProgressWindow(total_files)
@@ -374,12 +351,12 @@ def main():
         # 根据系统调整并行度
         max_workers = None
         if platform.system() == "Windows":
-            max_workers = psutil.cpu_count(logical=True) -1  # Windows上限制并发数
+            max_workers = psutil.cpu_count(logical=True) - 1  # Windows上限制并发数
 
         total, success = process_folders_parallel(
             input_dirs,
             output_dir,
-            progress_window.update,
+            lambda _: progress_window.update(),  # 使用lambda确保回调能触发
             max_workers
         )
 
@@ -406,7 +383,7 @@ def main():
     progress_window.root.mainloop()
 
     # 等待处理线程完成
-    thread.join(timeout=1)
+    thread.join()
 
 
 if __name__ == "__main__":
